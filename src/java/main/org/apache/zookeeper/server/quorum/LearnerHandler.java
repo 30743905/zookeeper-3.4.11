@@ -418,7 +418,7 @@ public class LearnerHandler extends ZooKeeperThread {
             }
             peerLastZxid = ss.getLastZxid();
             
-            /* the default to send to the follower */
+            //packetToSend表示Leader和Follower同步方式，默认采用SNAP方式，SNAP即采用镜像快照进行全量同步
             int packetToSend = Leader.SNAP;
             long zxidToSend = 0;
             long leaderLastZxid = 0;
@@ -432,19 +432,43 @@ public class LearnerHandler extends ZooKeeperThread {
             ReadLock rl = lock.readLock();
             try {
                 rl.lock();
-                //内存中记录的最大事务日志的id
+
+
+                /**
+                 * 1、committedLog是用来保存最近一段时间内执行的事务请求议案，个数限制默认为500个议案
+                 * 2、ZK启动的时候，首先会加载最新的一个SNAP镜像文件，找到这个镜像文件中最大的zxid，然后再从事务日志中加载该zxid后面的数据
+                 * ，同时会把从事务日志加载的数据存放到committedLog集合中
+                 * 3、maxCommittedLog表示committedLog中最大议案的zxid，minCommittedLog表示committedLog中最小议案的zxid
+                 */
                 final long maxCommittedLog = leader.zk.getZKDatabase().getmaxCommittedLog();
-                //内存中记录的最小事务日志的id
                 final long minCommittedLog = leader.zk.getZKDatabase().getminCommittedLog();
                 LOG.info("Synchronizing with Follower sid: " + sid
                         +" maxCommittedLog=0x"+Long.toHexString(maxCommittedLog)
                         +" minCommittedLog=0x"+Long.toHexString(minCommittedLog)
                         +" peerLastZxid=0x"+Long.toHexString(peerLastZxid));
+
                 //获取提交的Proposal, packet的type都是Leader.PROPOSAL
+                /**
+                 * SNAP + committedLog 就等于ZK的全部数据
+                 *
+                 * ZooKeeper集群数据同步分为4类，分别为直接差异化同步(DIFF)、先回滚再差异化同步(TRUNC+DIFF)、回滚同步(TRUNC)和全量同步(SNAP)。
+                 * 在同步之前,leader服务器先对peerLastZxid(该leader服务器最好处理的ZXID)、minCommittedLog、maxCommittedLog进行初始化，然后通过这3个ZXID值进行判断同步类型,并进行同步。
+                 *
+                 *
+                 * 1、对于集群数据同步而言，通常分为四类，直接差异化同步(DIFF同步)、先回滚再差异化同步(TRUNC+DIFF同步)、仅回滚同步(TRUNC同步)、全量同步(SNAP同步)
+                 * 2、Leader会优先以全量同步方式来同步数据(packetToSend默认被设置成SNAP)，然后会根据各Follower的peerLastZxid与当前Leader的peerLastZxid、minCommittedLog和maxCommittedLog进行
+                 *    比较以判断Leader和Follower之间的数据差异情况来决定最终的数据同步方式：
+                 * 　　  a.直接差异化同步(DIFF同步，peerLastZxid介于minCommittedLog和maxCommittedLog之间)。Leader首先向这个Learner发送一个DIFF指令，用于通知Learner进入差异化数据同步阶段，Leader即将把一些Proposal同步给自己，针对每个Proposal，Leader都会通过发送PROPOSAL内容数据包和COMMIT指令数据包来完成，
+                 * 　　  b.先回滚再差异化同步(TRUNC+DIFF同步，Leader已经将事务记录到本地事务日志中，但是没有成功发起Proposal流程)。当Leader发现某个Learner包含了一条自己没有的事务记录，那么就需要该Learner进行事务回滚，回滚到Leader服务器上存在的，同时也是最接近于peerLastZxid的ZXID。
+                 * 　　  c.仅回滚同步(TRUNC同步，peerLastZxid大于maxCommittedLog)。Leader要求Learner回滚到ZXID值为maxCommittedLog对应的事务操作。
+                 * 　　  d.全量同步(SNAP同步，peerLastZxid小于minCommittedLog或peerLastZxid不等于lastProcessedZxid)。Leader无法直接使用提议缓存队列和Learner进行同步，因此只能进行全量同步。Leader将本机的全量内存数据同步给Learner。Leader首先向Learner发送一个SNAP指令，通知Learner即将进行全量同步，随后，Leader会从内存数据库中获取到全量的数据节点和会话超时时间记录器，将他们序列化后传输给Learner。Learner接收到该全量数据后，会对其反序列化后载入到内存数据库中。
+                 */
                 LinkedList<Proposal> proposals = leader.zk.getZKDatabase().getCommittedLog();
 
+                //每个Learner客户端连接过来都会封装一个LearnerHandler线程单独处理Leader与该Learner的交互，peerLastZxid就是对端Learner的最大zxid
                 if (peerLastZxid == leader.zk.getZKDatabase().getDataTreeLastProcessedZxid()) {
                     // Follower is already sync with us, send empty diff
+                    //Learner的lastZxid等于当前Leader的lastZxid，说明Leader和Learner数据一致，不需要进行任何同步
                     LOG.info("leader and follower are in sync, zxid=0x{}",
                             Long.toHexString(peerLastZxid));
                     packetToSend = Leader.DIFF;
@@ -453,7 +477,15 @@ public class LearnerHandler extends ZooKeeperThread {
                 } else if (proposals.size() != 0) {
                     LOG.debug("proposal size is {}", proposals.size());
                     if ((maxCommittedLog >= peerLastZxid)
-                            && (minCommittedLog <= peerLastZxid)) {//如果learner的zxid在leader的[minCommittedLog, maxCommittedLog]范围内
+                            && (minCommittedLog <= peerLastZxid)) {
+                        /**
+                         * 1、如果learner的zxid在leader的[minCommittedLog, maxCommittedLog]范围内，
+                         *    这种情况说明Learner和Leader之间的数据差异较小，采用差异化同步(DIFF)
+                         * 2、首先，遍历committedLog集合，查找到Learner没有同步的议案，判断的方式是根据zxid，由于zxid是顺序递增的，
+                         *    committedLog存放的议案也是顺序的
+                         * 3、这里，存在一种特殊情况：Learner存在的议案在Leader的committedLog集合中不存在，这时就要先回滚(TRUNC)Learner，
+                         *    然后在进行差异化同步(DIFF)，即TRUNC+DIFF方式
+                         */
                         LOG.debug("Sending proposals to follower");
 
                         // as we look through proposals, this variable keeps track of previous
@@ -477,22 +509,30 @@ public class LearnerHandler extends ZooKeeperThread {
                                 prevProposalZxid = propose.packet.getZxid();
                                 continue;
                             } else {
+                                //该议案没有被Learner处理过
                                 // If we are sending the first packet, figure out whether to trunc
                                 // in case the follower has some proposals that the leader doesn't
                                 if (firstPacket) {//第一个发送的packet
                                     firstPacket = false;
                                     // Does the peer have some proposals that the leader hasn't seen yet
                                     if (prevProposalZxid < peerLastZxid) {//如果learner有一些leader不知道的请求(正常来说应该是prevProposalZxid == peerLastZxid)
+                                        /**
+                                         * 1、正常来说应该是prevProposalZxid == peerLastZxid，即prevProposalZxid后面的议案都需要同步到对端Learner
+                                         * 2、prevProposalZxid < peerLastZxid说明对端存在一些议案当前Leader上没有同步的，这时，首先对对端Learner进行
+                                         *    一次回滚(TRUNC)到prevProposalZxid操作
+                                         */
                                         // send a trunc message before sending the diff
                                         packetToSend = Leader.TRUNC;  //让learner回滚
                                         zxidToSend = prevProposalZxid;
                                         updates = zxidToSend;//让learner回滚
                                     }
                                 }
-                                queuePacket(propose.packet);//发送PROPOSAL
+                                //将差异的议案放入到发送队列中，等待发送到对端进行数据同步，注意：这里只是放入到队列中，并不会真正发送出去
+                                queuePacket(propose.packet);
                                 QuorumPacket qcommit = new QuorumPacket(Leader.COMMIT, propose.packet.getZxid(),
                                         null, null);
-                                queuePacket(qcommit);//让刚刚的PROPOSAL进行COMMIT，让learner同步
+                                //同理，每个议案都会对应一个commit议案，让Learner真正执行事务提交，将数据变更合入到内存DataTree上客户端即可见
+                                queuePacket(qcommit);
                             }
                         }
                     } else if (peerLastZxid > maxCommittedLog) {//learner的zxid比leader的大，让learner回滚
@@ -504,9 +544,11 @@ public class LearnerHandler extends ZooKeeperThread {
                         zxidToSend = maxCommittedLog;
                         updates = zxidToSend;
                     } else {
+                        //Learner的peerLastZxid小于minCommittedLog，表明Learner和Leader的数据差异较大，
+                        //应该采用全量数据同步(SNAP)，这里不进行任何操作是因为默认就是采用SNAP方式同步
                         LOG.warn("Unhandled proposal scenario");
                     }
-                } else {
+                } else {//committedLog议案集合为空情况，没法进行差异化比对，因此也只能进行全量数据同步(SNAP)
                     // just let the state transfer happen
                     LOG.debug("proposals is empty");
                 }               
@@ -518,8 +560,9 @@ public class LearnerHandler extends ZooKeeperThread {
                 rl.unlock();
             }
 
+            //生成NEWLEADER的packet,发给learner代表自己需要同步的信息发完了
              QuorumPacket newLeaderQP = new QuorumPacket(Leader.NEWLEADER,
-                    ZxidUtils.makeZxid(newEpoch, 0), null, null);//生成NEWLEADER的packet,发给learner代表自己需要同步的信息发完了
+                    ZxidUtils.makeZxid(newEpoch, 0), null, null);
              if (getVersion() < 0x10000) {
                 oa.writeRecord(newLeaderQP, "packet");
             } else {
@@ -530,7 +573,7 @@ public class LearnerHandler extends ZooKeeperThread {
             if (packetToSend == Leader.SNAP) {//如果是SNAP同步，获取zxid
                 zxidToSend = leader.zk.getZKDatabase().getDataTreeLastProcessedZxid();
             }
-            //告诉learner如何同步
+            //告诉learner如何同步，这里会被真实的发送到网络IO
             oa.writeRecord(new QuorumPacket(packetToSend, zxidToSend, null, null), "packet");
             bufferedOutput.flush();
             

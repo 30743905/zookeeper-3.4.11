@@ -873,25 +873,27 @@ public class Leader {
      * 
      * @param handler handler of the follower
      * @return last proposed zxid
+     *
+     * 就是learner同步的时候，同步方式是和leader的commitLog相关的，在此期间，记录在内存中的提议，以及即将生效的提议也要告诉给learner
      */
     synchronized public long startForwarding(LearnerHandler handler,
             long lastSeenZxid) {
         // Queue up any outstanding requests enabling the receipt of
         // new requests
-        if (lastProposed > lastSeenZxid) {
+        if (lastProposed > lastSeenZxid) {//如果自己的zxid比发给learner的zxid大
             for (Proposal p : toBeApplied) {
                 if (p.packet.getZxid() <= lastSeenZxid) {
-                    continue;
+                    continue;//即将生效的zxid，对应learner已经有记录了
                 }
                 handler.queuePacket(p.packet);
                 // Since the proposal has been committed we need to send the
                 // commit message also
                 QuorumPacket qp = new QuorumPacket(Leader.COMMIT, p.packet
                         .getZxid(), null, null);
-                handler.queuePacket(qp);
+                handler.queuePacket(qp);//加入handler的发送队列
             }
             // Only participant need to get outstanding proposals
-            if (handler.getLearnerType() == LearnerType.PARTICIPANT) {
+            if (handler.getLearnerType() == LearnerType.PARTICIPANT) {//如果是参与者，顺便把提议也发送过去
                 List<Long>zxids = new ArrayList<Long>(outstandingProposals.keySet());
                 Collections.sort(zxids);
                 for (Long zxid: zxids) {
@@ -903,9 +905,9 @@ public class Leader {
             }
         }
         if (handler.getLearnerType() == LearnerType.PARTICIPANT) {
-            addForwardingFollower(handler);
+            addForwardingFollower(handler);//加入 参与者 集合中
         } else {
-            addObserverLearnerHandler(handler);
+            addObserverLearnerHandler(handler);//否则加入到观察者 集合中
         }
                 
         return lastProposed;
